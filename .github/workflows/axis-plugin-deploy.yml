@@ -89,8 +89,23 @@ jobs:
           set -euo pipefail
           mkdir -p "$HOME/.ssh"
           chmod 700 "$HOME/.ssh"
-          printf '%s\n' "$AXIS_SSH_PRIVATE_KEY" > "$HOME/.ssh/axis_deploy_key"
+          KEY_CONTENT="$(printf '%s' "$AXIS_SSH_PRIVATE_KEY" | perl -0pe 's/\r//g; s/\\n/\n/g')"
+          printf '%s\n' "$KEY_CONTENT" > "$HOME/.ssh/axis_deploy_key"
           chmod 600 "$HOME/.ssh/axis_deploy_key"
+
+          KEY_FIRST_LINE="$(head -n 1 "$HOME/.ssh/axis_deploy_key" || true)"
+          case "$KEY_FIRST_LINE" in
+            "-----BEGIN OPENSSH PRIVATE KEY-----"|"-----BEGIN RSA PRIVATE KEY-----"|"-----BEGIN EC PRIVATE KEY-----"|"-----BEGIN PRIVATE KEY-----")
+              ;;
+            ssh-*)
+              echo "AXIS_DEPLOY_SSH_PRIVATE_KEY appears to contain a public key. Store the private key, not the .pub key."
+              exit 1
+              ;;
+            *)
+              echo "AXIS_DEPLOY_SSH_PRIVATE_KEY does not look like a valid private key. Re-save the GitHub secret with the full private key contents."
+              exit 1
+              ;;
+          esac
 
           {
             printf '%s\n' 'Host *'
