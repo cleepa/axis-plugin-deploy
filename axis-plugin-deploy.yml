@@ -1,0 +1,226 @@
+name: Axis Satellite Deploy
+
+on:
+  repository_dispatch:
+    types:
+      - axis_plugin_deploy
+
+permissions:
+  contents: read
+
+concurrency:
+  group: axis-deploy-${{ github.event.client_payload.job_id }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      AXIS_SHARED_SECRET: ${{ secrets.AXIS_DEPLOY_SHARED_SECRET }}
+      AXIS_SSH_PRIVATE_KEY: ${{ secrets.AXIS_DEPLOY_SSH_PRIVATE_KEY }}
+      AXIS_SSH_PASSPHRASE: ${{ secrets.AXIS_DEPLOY_SSH_PASSPHRASE }}
+
+    steps:
+      - name: Validate dispatch payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${{ github.event.client_payload.axis_url }}"
+          test -n "${{ github.event.client_payload.job_id }}"
+
+      - name: Prepare runner tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y unzip rsync jq openssh-client
+
+      - name: Claim deploy job from Axis
+        id: claim
+        shell: bash
+        env:
+          AXIS_URL: ${{ github.event.client_payload.axis_url }}
+          JOB_ID: ${{ github.event.client_payload.job_id }}
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            -X POST \
+            "${AXIS_URL%/}/deploy-jobs/${JOB_ID}/claim" \
+            -H "Authorization: Bearer ${AXIS_SHARED_SECRET}" \
+            -H "Content-Type: application/json" \
+            > "$RUNNER_TEMP/axis-job.json"
+
+          echo "job_json=$RUNNER_TEMP/axis-job.json" >> "$GITHUB_OUTPUT"
+          echo "job_id=$(jq -r '.job_id' "$RUNNER_TEMP/axis-job.json")" >> "$GITHUB_OUTPUT"
+          echo "package_url=$(jq -r '.package_url' "$RUNNER_TEMP/axis-job.json")" >> "$GITHUB_OUTPUT"
+          echo "plugin_file=$(jq -r '.plugin_file' "$RUNNER_TEMP/axis-job.json")" >> "$GITHUB_OUTPUT"
+          echo "axis_version=$(jq -r '.axis_version' "$RUNNER_TEMP/axis-job.json")" >> "$GITHUB_OUTPUT"
+          echo "report_url=$(jq -r '.report_url' "$RUNNER_TEMP/axis-job.json")" >> "$GITHUB_OUTPUT"
+          echo "report_token=$(jq -r '.report_token' "$RUNNER_TEMP/axis-job.json")" >> "$GITHUB_OUTPUT"
+          echo "ssh_login=$(jq -r '.deploy.ssh_login' "$RUNNER_TEMP/axis-job.json")" >> "$GITHUB_OUTPUT"
+          echo "wp_root=$(jq -r '.deploy.root' "$RUNNER_TEMP/axis-job.json")" >> "$GITHUB_OUTPUT"
+          echo "target_name=$(jq -r '.deploy.target_name' "$RUNNER_TEMP/axis-job.json")" >> "$GITHUB_OUTPUT"
+          echo "is_single=$(jq -r '.deploy.is_single' "$RUNNER_TEMP/axis-job.json")" >> "$GITHUB_OUTPUT"
+
+      - name: Download plugin package from Axis
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL "${{ steps.claim.outputs.package_url }}" -o "$RUNNER_TEMP/plugin-package.zip"
+          unzip -q "$RUNNER_TEMP/plugin-package.zip" -d "$RUNNER_TEMP/plugin-package"
+
+      - name: Configure SSH credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          printf '%s\n' "$AXIS_SSH_PRIVATE_KEY" > "$HOME/.ssh/axis_deploy_key"
+          chmod 600 "$HOME/.ssh/axis_deploy_key"
+
+          cat > "$HOME/.ssh/config" <<EOF
+Host *
+  IdentityFile $HOME/.ssh/axis_deploy_key
+  IdentitiesOnly yes
+  StrictHostKeyChecking yes
+EOF
+          chmod 600 "$HOME/.ssh/config"
+
+          eval "$(ssh-agent -s)"
+          echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+          echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+          if [ -n "${AXIS_SSH_PASSPHRASE:-}" ]; then
+            cat > "$RUNNER_TEMP/axis-askpass.sh" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$AXIS_SSH_PASSPHRASE"
+EOF
+            chmod +x "$RUNNER_TEMP/axis-askpass.sh"
+            DISPLAY=:0 SSH_ASKPASS="$RUNNER_TEMP/axis-askpass.sh" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$HOME/.ssh/axis_deploy_key" < /dev/null
+          else
+            ssh-add "$HOME/.ssh/axis_deploy_key"
+          fi
+
+          SSH_HOST="${{ steps.claim.outputs.ssh_login }}"
+          SSH_HOST="${SSH_HOST#*@}"
+          SSH_HOST="${SSH_HOST%%:*}"
+          ssh-keyscan -H "$SSH_HOST" >> "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Deploy plugin over SSH
+        id: deploy
+        continue-on-error: true
+        shell: bash
+        env:
+          SSH_LOGIN: ${{ steps.claim.outputs.ssh_login }}
+          WP_ROOT: ${{ steps.claim.outputs.wp_root }}
+          TARGET_NAME: ${{ steps.claim.outputs.target_name }}
+          IS_SINGLE: ${{ steps.claim.outputs.is_single }}
+          JOB_ID: ${{ steps.claim.outputs.job_id }}
+          AXIS_VERSION: ${{ steps.claim.outputs.axis_version }}
+        run: |
+          set -Eeuo pipefail
+          trap 'echo "Deploy command failed." > "$RUNNER_TEMP/deploy-message.txt"' ERR
+
+          SSH_ARGS="-o BatchMode=yes -o StrictHostKeyChecking=yes"
+          REMOTE_STAGE_ROOT="${WP_ROOT%/}/wp-content/axis-deploy/stage-${JOB_ID}"
+          REMOTE_STAGE="${REMOTE_STAGE_ROOT}/${TARGET_NAME}"
+          REMOTE_TARGET="${WP_ROOT%/}/wp-content/plugins/${TARGET_NAME}"
+          REMOTE_BACKUP="${WP_ROOT%/}/wp-content/plugins/.axis-backup-${TARGET_NAME}-${JOB_ID}"
+
+          if [ "$IS_SINGLE" = "true" ]; then
+            LOCAL_SOURCE="$RUNNER_TEMP/plugin-package/${TARGET_NAME}"
+            ssh $SSH_ARGS "$SSH_LOGIN" "mkdir -p \"$(dirname "$REMOTE_STAGE")\""
+            rsync -az -e "ssh $SSH_ARGS" "$LOCAL_SOURCE" "${SSH_LOGIN}:${REMOTE_STAGE}"
+          else
+            LOCAL_SOURCE="$RUNNER_TEMP/plugin-package/${TARGET_NAME}/"
+            ssh $SSH_ARGS "$SSH_LOGIN" "mkdir -p \"$REMOTE_STAGE\""
+            rsync -az --delete -e "ssh $SSH_ARGS" "$LOCAL_SOURCE" "${SSH_LOGIN}:${REMOTE_STAGE}/"
+          fi
+
+          ssh $SSH_ARGS "$SSH_LOGIN" "bash -s" <<EOF
+set -e
+REMOTE_STAGE_ROOT=${REMOTE_STAGE_ROOT@Q}
+REMOTE_STAGE=${REMOTE_STAGE@Q}
+REMOTE_TARGET=${REMOTE_TARGET@Q}
+REMOTE_BACKUP=${REMOTE_BACKUP@Q}
+IS_SINGLE=${IS_SINGLE@Q}
+
+mkdir -p "\$(dirname "\$REMOTE_TARGET")"
+if [ -e "\$REMOTE_BACKUP" ]; then rm -rf "\$REMOTE_BACKUP"; fi
+
+if [ -e "\$REMOTE_TARGET" ]; then
+  mv "\$REMOTE_TARGET" "\$REMOTE_BACKUP"
+fi
+
+if [ "\$IS_SINGLE" = "true" ]; then
+  mv "\$REMOTE_STAGE" "\$REMOTE_TARGET"
+else
+  mv "\$REMOTE_STAGE" "\$REMOTE_TARGET"
+fi
+
+rm -rf "\$REMOTE_STAGE_ROOT"
+if [ -e "\$REMOTE_BACKUP" ]; then rm -rf "\$REMOTE_BACKUP"; fi
+EOF
+
+          printf 'GitHub Actions deployed the plugin over SSH.' > "$RUNNER_TEMP/deploy-message.txt"
+          echo "to_version=${AXIS_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Report successful deploy back to Axis
+        if: steps.deploy.outcome == 'success'
+        shell: bash
+        env:
+          REPORT_URL: ${{ steps.claim.outputs.report_url }}
+          REPORT_TOKEN: ${{ steps.claim.outputs.report_token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          AXIS_VERSION: ${{ steps.claim.outputs.axis_version }}
+        run: |
+          set -euo pipefail
+          MESSAGE="$(cat "$RUNNER_TEMP/deploy-message.txt")"
+          jq -n \
+            --arg status "success" \
+            --arg message "$MESSAGE" \
+            --arg run_url "$RUN_URL" \
+            --arg to_version "$AXIS_VERSION" \
+            '{status:$status,message:$message,run_url:$run_url,to_version:$to_version}' \
+          | curl -fsSL \
+              -X POST \
+              "$REPORT_URL" \
+              -H "Authorization: Bearer ${AXIS_SHARED_SECRET}" \
+              -H "X-Axis-Report-Token: ${REPORT_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data-binary @-
+
+      - name: Report failed deploy back to Axis
+        if: steps.deploy.outcome != 'success'
+        shell: bash
+        env:
+          REPORT_URL: ${{ steps.claim.outputs.report_url }}
+          REPORT_TOKEN: ${{ steps.claim.outputs.report_token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -f "$RUNNER_TEMP/deploy-message.txt" ]; then
+            MESSAGE="$(cat "$RUNNER_TEMP/deploy-message.txt")"
+          else
+            MESSAGE="GitHub Actions deploy failed."
+          fi
+
+          jq -n \
+            --arg status "failed" \
+            --arg message "$MESSAGE" \
+            --arg run_url "$RUN_URL" \
+            '{status:$status,message:$message,run_url:$run_url}' \
+          | curl -fsSL \
+              -X POST \
+              "$REPORT_URL" \
+              -H "Authorization: Bearer ${AXIS_SHARED_SECRET}" \
+              -H "X-Axis-Report-Token: ${REPORT_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data-binary @-
+
+      - name: Fail workflow when deploy failed
+        if: steps.deploy.outcome != 'success'
+        shell: bash
+        run: exit 1
