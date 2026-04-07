@@ -80,22 +80,22 @@ jobs:
           printf '%s\n' "$AXIS_SSH_PRIVATE_KEY" > "$HOME/.ssh/axis_deploy_key"
           chmod 600 "$HOME/.ssh/axis_deploy_key"
 
-          cat > "$HOME/.ssh/config" <<EOF
-Host *
-  IdentityFile $HOME/.ssh/axis_deploy_key
-  IdentitiesOnly yes
-  StrictHostKeyChecking yes
-EOF
+          {
+            printf '%s\n' 'Host *'
+            printf '%s\n' "  IdentityFile $HOME/.ssh/axis_deploy_key"
+            printf '%s\n' '  IdentitiesOnly yes'
+            printf '%s\n' '  StrictHostKeyChecking yes'
+          } > "$HOME/.ssh/config"
           chmod 600 "$HOME/.ssh/config"
 
           eval "$(ssh-agent -s)"
           echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
           echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
           if [ -n "${AXIS_SSH_PASSPHRASE:-}" ]; then
-            cat > "$RUNNER_TEMP/axis-askpass.sh" <<'EOF'
-#!/bin/sh
-printf '%s\n' "$AXIS_SSH_PASSPHRASE"
-EOF
+            {
+              printf '%s\n' '#!/bin/sh'
+              printf '%s\n' 'printf '"'"'%s\n'"'"' "$AXIS_SSH_PASSPHRASE"'
+            } > "$RUNNER_TEMP/axis-askpass.sh"
             chmod +x "$RUNNER_TEMP/axis-askpass.sh"
             DISPLAY=:0 SSH_ASKPASS="$RUNNER_TEMP/axis-askpass.sh" SSH_ASKPASS_REQUIRE=force setsid ssh-add "$HOME/.ssh/axis_deploy_key" < /dev/null
           else
@@ -139,30 +139,9 @@ EOF
             rsync -az --delete -e "ssh $SSH_ARGS" "$LOCAL_SOURCE" "${SSH_LOGIN}:${REMOTE_STAGE}/"
           fi
 
-          ssh $SSH_ARGS "$SSH_LOGIN" "bash -s" <<EOF
-set -e
-REMOTE_STAGE_ROOT=${REMOTE_STAGE_ROOT@Q}
-REMOTE_STAGE=${REMOTE_STAGE@Q}
-REMOTE_TARGET=${REMOTE_TARGET@Q}
-REMOTE_BACKUP=${REMOTE_BACKUP@Q}
-IS_SINGLE=${IS_SINGLE@Q}
-
-mkdir -p "\$(dirname "\$REMOTE_TARGET")"
-if [ -e "\$REMOTE_BACKUP" ]; then rm -rf "\$REMOTE_BACKUP"; fi
-
-if [ -e "\$REMOTE_TARGET" ]; then
-  mv "\$REMOTE_TARGET" "\$REMOTE_BACKUP"
-fi
-
-if [ "\$IS_SINGLE" = "true" ]; then
-  mv "\$REMOTE_STAGE" "\$REMOTE_TARGET"
-else
-  mv "\$REMOTE_STAGE" "\$REMOTE_TARGET"
-fi
-
-rm -rf "\$REMOTE_STAGE_ROOT"
-if [ -e "\$REMOTE_BACKUP" ]; then rm -rf "\$REMOTE_BACKUP"; fi
-EOF
+          REMOTE_TARGET_DIR="$(dirname "$REMOTE_TARGET")"
+          REMOTE_SCRIPT="set -e; mkdir -p $(printf '%q' "$REMOTE_TARGET_DIR"); if [ -e $(printf '%q' "$REMOTE_BACKUP") ]; then rm -rf $(printf '%q' "$REMOTE_BACKUP"); fi; if [ -e $(printf '%q' "$REMOTE_TARGET") ]; then mv $(printf '%q' "$REMOTE_TARGET") $(printf '%q' "$REMOTE_BACKUP"); fi; mv $(printf '%q' "$REMOTE_STAGE") $(printf '%q' "$REMOTE_TARGET"); rm -rf $(printf '%q' "$REMOTE_STAGE_ROOT"); if [ -e $(printf '%q' "$REMOTE_BACKUP") ]; then rm -rf $(printf '%q' "$REMOTE_BACKUP"); fi"
+          ssh $SSH_ARGS "$SSH_LOGIN" "bash -lc $(printf '%q' "$REMOTE_SCRIPT")"
 
           printf 'GitHub Actions deployed the plugin over SSH.' > "$RUNNER_TEMP/deploy-message.txt"
           echo "to_version=${AXIS_VERSION}" >> "$GITHUB_OUTPUT"
