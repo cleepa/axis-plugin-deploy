@@ -121,26 +121,39 @@ jobs:
           AXIS_VERSION: ${{ steps.claim.outputs.axis_version }}
         run: |
           set -Eeuo pipefail
-          trap 'echo "Deploy command failed." > "$RUNNER_TEMP/deploy-message.txt"' ERR
+          exec > >(tee "$RUNNER_TEMP/deploy-step.log") 2>&1
+          trap 'status=$?; if [ -f "$RUNNER_TEMP/deploy-step.log" ]; then tail -n 40 "$RUNNER_TEMP/deploy-step.log" | sed "s/[^[:print:][:space:]]//g" | tr "\n" " " | sed "s/  */ /g" | cut -c1-1800 > "$RUNNER_TEMP/deploy-message.txt"; else echo "Deploy command failed." > "$RUNNER_TEMP/deploy-message.txt"; fi; exit $status' ERR
 
           SSH_ARGS="-o BatchMode=yes -o StrictHostKeyChecking=yes"
           REMOTE_STAGE_ROOT="${WP_ROOT%/}/wp-content/axis-deploy/stage-${JOB_ID}"
           REMOTE_STAGE="${REMOTE_STAGE_ROOT}/${TARGET_NAME}"
           REMOTE_TARGET="${WP_ROOT%/}/wp-content/plugins/${TARGET_NAME}"
           REMOTE_BACKUP="${WP_ROOT%/}/wp-content/plugins/.axis-backup-${TARGET_NAME}-${JOB_ID}"
+          REMOTE_TARGET_DIR="$(dirname "$REMOTE_TARGET")"
+
+          echo "Deploy target: $SSH_LOGIN"
+          echo "WordPress root: $WP_ROOT"
+          echo "Plugin target: $REMOTE_TARGET"
+          echo "Remote stage: $REMOTE_STAGE"
+          echo "Single-file plugin: $IS_SINGLE"
+          echo "Verifying remote WordPress root exists..."
+          ssh $SSH_ARGS "$SSH_LOGIN" "test -d $(printf '%q' "$WP_ROOT")"
+          echo "Remote WordPress root is reachable."
 
           if [ "$IS_SINGLE" = "true" ]; then
             LOCAL_SOURCE="$RUNNER_TEMP/plugin-package/${TARGET_NAME}"
+            echo "Uploading single plugin file from $LOCAL_SOURCE"
             ssh $SSH_ARGS "$SSH_LOGIN" "mkdir -p \"$(dirname "$REMOTE_STAGE")\""
             rsync -az -e "ssh $SSH_ARGS" "$LOCAL_SOURCE" "${SSH_LOGIN}:${REMOTE_STAGE}"
           else
             LOCAL_SOURCE="$RUNNER_TEMP/plugin-package/${TARGET_NAME}/"
+            echo "Uploading plugin directory from $LOCAL_SOURCE"
             ssh $SSH_ARGS "$SSH_LOGIN" "mkdir -p \"$REMOTE_STAGE\""
             rsync -az --delete -e "ssh $SSH_ARGS" "$LOCAL_SOURCE" "${SSH_LOGIN}:${REMOTE_STAGE}/"
           fi
 
-          REMOTE_TARGET_DIR="$(dirname "$REMOTE_TARGET")"
           REMOTE_SCRIPT="set -e; mkdir -p $(printf '%q' "$REMOTE_TARGET_DIR"); if [ -e $(printf '%q' "$REMOTE_BACKUP") ]; then rm -rf $(printf '%q' "$REMOTE_BACKUP"); fi; if [ -e $(printf '%q' "$REMOTE_TARGET") ]; then mv $(printf '%q' "$REMOTE_TARGET") $(printf '%q' "$REMOTE_BACKUP"); fi; mv $(printf '%q' "$REMOTE_STAGE") $(printf '%q' "$REMOTE_TARGET"); rm -rf $(printf '%q' "$REMOTE_STAGE_ROOT"); if [ -e $(printf '%q' "$REMOTE_BACKUP") ]; then rm -rf $(printf '%q' "$REMOTE_BACKUP"); fi"
+          echo "Swapping staged plugin into place on remote host..."
           ssh $SSH_ARGS "$SSH_LOGIN" "bash -lc $(printf '%q' "$REMOTE_SCRIPT")"
 
           printf 'GitHub Actions deployed the plugin over SSH.' > "$RUNNER_TEMP/deploy-message.txt"
