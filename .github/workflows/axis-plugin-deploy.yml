@@ -45,12 +45,24 @@ jobs:
           JOB_ID: ${{ github.event.client_payload.job_id }}
         run: |
           set -euo pipefail
-          curl -fsSL \
+          HTTP_CODE="$(curl -sSL \
             -X POST \
             "${AXIS_URL%/}/deploy-jobs/${JOB_ID}/claim" \
             -H "Authorization: Bearer ${AXIS_SHARED_SECRET}" \
             -H "Content-Type: application/json" \
-            > "$RUNNER_TEMP/axis-job.json"
+            -o "$RUNNER_TEMP/axis-job.json" \
+            -w '%{http_code}')"
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "Axis claim request failed with HTTP $HTTP_CODE"
+            if [ -f "$RUNNER_TEMP/axis-job.json" ]; then
+              cat "$RUNNER_TEMP/axis-job.json"
+            fi
+            if [ "$HTTP_CODE" = "409" ]; then
+              echo "This Axis deploy job was already claimed. Trigger a new Push to Satellite from Axis instead of rerunning an older GitHub Actions run."
+            fi
+            exit 1
+          fi
 
           echo "job_json=$RUNNER_TEMP/axis-job.json" >> "$GITHUB_OUTPUT"
           echo "job_id=$(jq -r '.job_id' "$RUNNER_TEMP/axis-job.json")" >> "$GITHUB_OUTPUT"
@@ -160,7 +172,7 @@ jobs:
           echo "to_version=${AXIS_VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Report successful deploy back to Axis
-        if: steps.deploy.outcome == 'success'
+        if: ${{ always() && steps.claim.outcome == 'success' && steps.deploy.outcome == 'success' }}
         shell: bash
         env:
           REPORT_URL: ${{ steps.claim.outputs.report_url }}
@@ -185,7 +197,7 @@ jobs:
               --data-binary @-
 
       - name: Report failed deploy back to Axis
-        if: steps.deploy.outcome != 'success'
+        if: ${{ always() && steps.claim.outcome == 'success' && steps.deploy.outcome != 'success' }}
         shell: bash
         env:
           REPORT_URL: ${{ steps.claim.outputs.report_url }}
@@ -213,6 +225,6 @@ jobs:
               --data-binary @-
 
       - name: Fail workflow when deploy failed
-        if: steps.deploy.outcome != 'success'
+        if: ${{ always() && (steps.claim.outcome != 'success' || steps.deploy.outcome != 'success') }}
         shell: bash
         run: exit 1
