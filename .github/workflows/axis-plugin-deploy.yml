@@ -142,6 +142,7 @@ jobs:
         env:
           SSH_LOGIN: ${{ steps.claim.outputs.ssh_login }}
           WP_ROOT: ${{ steps.claim.outputs.wp_root }}
+          PLUGIN_FILE: ${{ steps.claim.outputs.plugin_file }}
           TARGET_NAME: ${{ steps.claim.outputs.target_name }}
           IS_SINGLE: ${{ steps.claim.outputs.is_single }}
           JOB_ID: ${{ steps.claim.outputs.job_id }}
@@ -157,15 +158,27 @@ jobs:
           REMOTE_TARGET="${WP_ROOT%/}/wp-content/plugins/${TARGET_NAME}"
           REMOTE_BACKUP="${WP_ROOT%/}/wp-content/plugins/.axis-backup-${TARGET_NAME}-${JOB_ID}"
           REMOTE_TARGET_DIR="$(dirname "$REMOTE_TARGET")"
+          REMOTE_PLUGIN_MAIN="${WP_ROOT%/}/wp-content/plugins/${PLUGIN_FILE}"
+
+          read_remote_version() {
+            local remote_file="$1"
+            local remote_file_escaped
+            remote_file_escaped="$(printf '%q' "$remote_file")"
+            ssh $SSH_ARGS "$SSH_LOGIN" "if [ -f $remote_file_escaped ]; then awk 'tolower(\$0) ~ /^[[:space:]/*#@]*version:[[:space:]]*/ { line=\$0; sub(/^[[:space:]/*#@]*[Vv][Ee][Rr][Ss][Ii][Oo][Nn]:[[:space:]]*/, \"\", line); print line; exit }' $remote_file_escaped; fi"
+          }
 
           echo "Deploy target: $SSH_LOGIN"
           echo "WordPress root: $WP_ROOT"
           echo "Plugin target: $REMOTE_TARGET"
+          echo "Plugin main file: $REMOTE_PLUGIN_MAIN"
           echo "Remote stage: $REMOTE_STAGE"
           echo "Single-file plugin: $IS_SINGLE"
           echo "Verifying remote WordPress root exists..."
           ssh $SSH_ARGS "$SSH_LOGIN" "test -d $(printf '%q' "$WP_ROOT")"
           echo "Remote WordPress root is reachable."
+
+          FROM_VERSION="$(read_remote_version "$REMOTE_PLUGIN_MAIN" | tr -d '\r' | head -n 1)"
+          echo "Remote version before deploy: ${FROM_VERSION:-unknown}"
 
           if [ "$IS_SINGLE" = "true" ]; then
             LOCAL_SOURCE="$RUNNER_TEMP/plugin-package/${TARGET_NAME}"
@@ -183,8 +196,20 @@ jobs:
           echo "Swapping staged plugin into place on remote host..."
           ssh $SSH_ARGS "$SSH_LOGIN" "bash -lc $(printf '%q' "$REMOTE_SCRIPT")"
 
-          printf 'GitHub Actions deployed the plugin over SSH.' > "$RUNNER_TEMP/deploy-message.txt"
-          echo "to_version=${AXIS_VERSION}" >> "$GITHUB_OUTPUT"
+          TO_VERSION="$(read_remote_version "$REMOTE_PLUGIN_MAIN" | tr -d '\r' | head -n 1)"
+          if [ -z "$TO_VERSION" ]; then
+            echo "GitHub Actions deployed the plugin files, but could not read the remote plugin version from $REMOTE_PLUGIN_MAIN." > "$RUNNER_TEMP/deploy-message.txt"
+            exit 1
+          fi
+
+          if [ -n "$AXIS_VERSION" ] && [ "$TO_VERSION" != "$AXIS_VERSION" ]; then
+            printf 'GitHub Actions deployed the plugin files, but the remote plugin still reports version %s instead of %s.' "$TO_VERSION" "$AXIS_VERSION" > "$RUNNER_TEMP/deploy-message.txt"
+            exit 1
+          fi
+
+          printf 'GitHub Actions deployed the plugin over SSH and verified remote version %s.' "$TO_VERSION" > "$RUNNER_TEMP/deploy-message.txt"
+          echo "from_version=${FROM_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "to_version=${TO_VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Report successful deploy back to Axis
         if: ${{ always() && steps.claim.outcome == 'success' && steps.deploy.outcome == 'success' }}
@@ -193,7 +218,8 @@ jobs:
           REPORT_URL: ${{ steps.claim.outputs.report_url }}
           REPORT_TOKEN: ${{ steps.claim.outputs.report_token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          AXIS_VERSION: ${{ steps.claim.outputs.axis_version }}
+          FROM_VERSION: ${{ steps.deploy.outputs.from_version }}
+          TO_VERSION: ${{ steps.deploy.outputs.to_version }}
         run: |
           set -euo pipefail
           MESSAGE="$(cat "$RUNNER_TEMP/deploy-message.txt")"
@@ -201,8 +227,9 @@ jobs:
             --arg status "success" \
             --arg message "$MESSAGE" \
             --arg run_url "$RUN_URL" \
-            --arg to_version "$AXIS_VERSION" \
-            '{status:$status,message:$message,run_url:$run_url,to_version:$to_version}' \
+            --arg from_version "$FROM_VERSION" \
+            --arg to_version "$TO_VERSION" \
+            '{status:$status,message:$message,run_url:$run_url,from_version:$from_version,to_version:$to_version}' \
           | curl -fsSL \
               -X POST \
               "$REPORT_URL" \
