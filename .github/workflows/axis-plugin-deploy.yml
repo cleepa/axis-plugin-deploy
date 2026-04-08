@@ -164,7 +164,8 @@ jobs:
             local remote_file="$1"
             local remote_file_escaped
             remote_file_escaped="$(printf '%q' "$remote_file")"
-            ssh $SSH_ARGS "$SSH_LOGIN" "if [ -f $remote_file_escaped ]; then awk 'tolower(\$0) ~ /^[[:space:]/*#@]*version:[[:space:]]*/ { line=\$0; sub(/^[[:space:]/*#@]*[Vv][Ee][Rr][Ss][Ii][Oo][Nn]:[[:space:]]*/, \"\", line); print line; exit }' $remote_file_escaped; fi"
+            ssh $SSH_ARGS "$SSH_LOGIN" "if [ -f $remote_file_escaped ]; then cat $remote_file_escaped; fi" \
+              | awk 'tolower($0) ~ /^[[:space:]/*#@]*version:[[:space:]]*/ { line=$0; sub(/^[[:space:]/*#@]*[Vv][Ee][Rr][Ss][Ii][Oo][Nn]:[[:space:]]*/, "", line); print line; exit }'
           }
 
           echo "Deploy target: $SSH_LOGIN"
